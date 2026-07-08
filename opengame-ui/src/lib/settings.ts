@@ -30,7 +30,46 @@ export interface GeneralConfig {
 }
 
 /**
- * Full settings shape matching ~/.qwen/settings.json structure.
+ * Web search provider configuration.
+ */
+export interface WebSearchProvider {
+  type: "tavily" | "google" | "dashscope"
+  apiKey?: string
+  searchEngineId?: string
+}
+
+export interface WebSearchConfig {
+  provider: WebSearchProvider[]
+  default: string
+}
+
+/**
+ * Tool filtering configuration.
+ */
+export interface ToolFilteringConfig {
+  allowed: string[]
+  exclude: string[]
+}
+
+/**
+ * MCP server configuration.
+ */
+export interface MCPServerConfig {
+  command: string
+  args?: string[]
+  env?: Record<string, string>
+  disabled?: boolean
+}
+
+/**
+ * Extensions configuration.
+ */
+export interface ExtensionsConfig {
+  disabled: string[]
+}
+
+/**
+ * Full settings shape used by the UI.
  */
 export interface OpenGameSettings {
   mainLLM: MainLLMConfig
@@ -41,6 +80,10 @@ export interface OpenGameSettings {
     audio: ProviderConfig
   }
   general: GeneralConfig
+  webSearch: WebSearchConfig
+  toolFiltering: ToolFilteringConfig
+  mcpServers: Record<string, MCPServerConfig>
+  extensions: ExtensionsConfig
 }
 
 export const DEFAULT_SETTINGS: OpenGameSettings = {
@@ -62,6 +105,18 @@ export const DEFAULT_SETTINGS: OpenGameSettings = {
     chatRecording: true,
     approvalMode: "default",
     maxSessionTurns: 100,
+  },
+  webSearch: {
+    provider: [],
+    default: "dashscope",
+  },
+  toolFiltering: {
+    allowed: [],
+    exclude: [],
+  },
+  mcpServers: {},
+  extensions: {
+    disabled: [],
   },
 }
 
@@ -116,6 +171,34 @@ export function settingsToEnvVars(settings: OpenGameSettings): Record<string, st
   if (settings.general.proxy) env.HTTP_PROXY = settings.general.proxy
 
   return env
+}
+
+/**
+ * Build CLI flags from settings for the generate command.
+ */
+export function settingsToCliFlags(settings: OpenGameSettings): string[] {
+  const flags: string[] = []
+
+  if (settings.general.approvalMode && settings.general.approvalMode !== "default") {
+    flags.push("--approval-mode", settings.general.approvalMode)
+  }
+  if (settings.mainLLM.model) {
+    flags.push("--model", settings.mainLLM.model)
+  }
+  if (settings.general.maxSessionTurns && settings.general.maxSessionTurns !== 100) {
+    flags.push("--max-session-turns", String(settings.general.maxSessionTurns))
+  }
+  if (settings.toolFiltering.allowed.length > 0) {
+    flags.push("--allowed-tools", settings.toolFiltering.allowed.join(","))
+  }
+  if (settings.toolFiltering.exclude.length > 0) {
+    flags.push("--exclude-tools", settings.toolFiltering.exclude.join(","))
+  }
+  if (settings.general.debug) {
+    flags.push("--debug")
+  }
+
+  return flags
 }
 
 /**

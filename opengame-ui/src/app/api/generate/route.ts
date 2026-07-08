@@ -1,5 +1,21 @@
 import { NextRequest } from "next/server"
 import { spawn } from "child_process"
+import { readFileSync, existsSync } from "fs"
+import { join } from "path"
+import { homedir } from "os"
+
+/**
+ * Read settings from ~/.qwen/settings.json (written by /api/settings PUT).
+ */
+function readSettingsFile(): Record<string, unknown> {
+  try {
+    const p = join(homedir(), ".qwen", "settings.json")
+    if (!existsSync(p)) return {}
+    return JSON.parse(readFileSync(p, "utf-8"))
+  } catch {
+    return {}
+  }
+}
 
 export async function POST(request: NextRequest) {
   const body = await request.json()
@@ -14,26 +30,18 @@ export async function POST(request: NextRequest) {
 
   // Build CLI arguments
   const args: string[] = []
-
-  // Prompt (use positional argument, modern CLI style)
   args.push(prompt)
 
-  // Approval mode
+  // From form options (override everything)
   if (options["approval-mode"]) {
     args.push("--approval-mode", options["approval-mode"])
   }
-
-  // Model
   if (options["model"]) {
     args.push("--model", options["model"])
   }
-
-  // Sandbox
   if (options["sandbox"] === "true") {
     args.push("--sandbox")
   }
-
-  // Max session turns
   if (options["max-session-turns"]) {
     args.push("--max-session-turns", options["max-session-turns"])
   }
@@ -41,7 +49,87 @@ export async function POST(request: NextRequest) {
   // Output format for streaming
   args.push("--output-format", "stream-json")
 
-  // Create a ReadableStream for SSE
+  // Build env
+  const env = { ...process.env }
+
+  // Parse settings from X-Settings header (UI state)
+  let uiSettings: Record<string, unknown> = {}
+  try {
+    const settingsHeader = request.headers.get("x-settings")
+    if (settingsHeader) {
+      uiSettings = JSON.parse(settingsHeader)
+
+      // Main LLM env vars
+      const mainLLM = uiSettings.mainLLM as Record<string, unknown> | undefined
+      if (mainLLM?.apiKey) env.OPENAI_API_KEY = mainLLM.apiKey as string
+      if (mainLLM?.baseUrl) env.OPENAI_BASE_URL = mainLLM.baseUrl as string
+      if (mainLLM?.model) env.OPENAI_MODEL = mainLLM.model as string
+
+      // Per-modality provider env vars
+      const providers = uiSettings.providers as Record<string, Record<string, unknown>> | undefined
+      if (providers) {
+        for (const mod of ["reasoning", "image", "video", "audio"]) {
+          const cfg = providers[mod]
+          if (!cfg?.provider) continue
+          const prefix = `OPENGAME_${mod.toUpperCase()}`
+          env[`${prefix}_PROVIDER`] = cfg.provider as string
+          if (cfg.apiKey) env[`${prefix}_API_KEY`] = cfg.apiKey as string
+          if (cfg.baseUrl) env[`${prefix}_BASE_URL`] = cfg.baseUrl as string
+          if (cfg.model) env[`${prefix}_MODEL`] = cfg.model as string
+        }
+      }
+
+      // Tool filtering CLI flags from UI
+      const toolFiltering = uiSettings.toolFiltering as Record<string, unknown> | undefined
+      if (toolFiltering) {
+        const allowed = toolFiltering.allowed as string[] | undefined
+        if (allowed && allowed.length > 0) {
+          args.push("--allowed-tools", ...allowed)
+        }
+        const exclude = toolFiltering.exclude as string[] | undefined
+        if (exclude && exclude.length > 0) {
+          args.push("--exclude-tools", ...exclude)
+        }
+      }
+    }
+  } catch {
+    // ignore parse errors
+  }
+
+  // Also read from ~/.qwen/settings.json for any remaining CLI flags
+  // that may not have been passed via X-Settings (e.g. extensions, mcp)
+  const fileSettings = readSettingsFile()
+
+  // Extensions
+  const extensions = fileSettings.extensions as Record<string, unknown> | undefined
+  const disabledExt = extensions?.disabled as string[] | undefined
+  if (disabledExt && disabledExt.length > 0) {
+    // CLI uses --extensions to list extensions to include;
+    // disabling is handled via settings.json, no CLI flag needed.
+  }
+
+  // Resolve CLI path
+  let cliCmd = "opengame"
+  let cliArgs = args
+
+  const { execSync } = require("child_process")
+  try {
+    execSync("which opengame", { stdio: "ignore" })
+  } catch {
+    try {
+      const opengameDir = process.env.OPENGAME_DIR || "../"
+      const distPath = `${opengameDir}dist/cli.js`
+      cliCmd = "node"
+      cliArgs = [distPath, ...args]
+    } catch {
+      return new Response(
+        JSON.stringify({ error: "OpenGame CLI not found" }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      )
+    }
+  }
+
+  // SSE stream
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder()
@@ -49,61 +137,6 @@ export async function POST(request: NextRequest) {
       const send = (type: string, content: string) => {
         const data = JSON.stringify({ type, content })
         controller.enqueue(encoder.encode(`data: ${data}\n\n`))
-      }
-
-      // Try to find opengame CLI
-      const cliPaths = ["opengame", "npx", "node"]
-
-      // Build env from request headers (settings passed from client)
-      const env = { ...process.env }
-
-      // The client passes settings via X-Settings header
-      try {
-        const settingsHeader = request.headers.get("x-settings")
-        if (settingsHeader) {
-          const settings = JSON.parse(settingsHeader)
-
-          // Main LLM
-          if (settings.mainLLM?.apiKey) env.OPENAI_API_KEY = settings.mainLLM.apiKey
-          if (settings.mainLLM?.baseUrl) env.OPENAI_BASE_URL = settings.mainLLM.baseUrl
-          if (settings.mainLLM?.model) env.OPENAI_MODEL = settings.mainLLM.model
-
-          // Per-modality providers
-          const modalities = ["reasoning", "image", "video", "audio"] as const
-          for (const mod of modalities) {
-            const cfg = settings.providers?.[mod]
-            if (!cfg?.provider) continue
-            const prefix = `OPENGAME_${mod.toUpperCase()}`
-            env[`${prefix}_PROVIDER`] = cfg.provider
-            if (cfg.apiKey) env[`${prefix}_API_KEY`] = cfg.apiKey
-            if (cfg.baseUrl) env[`${prefix}_BASE_URL`] = cfg.baseUrl
-            if (cfg.model) env[`${prefix}_MODEL`] = cfg.model
-          }
-        }
-      } catch {
-        // ignore parse errors
-      }
-
-      // Resolve CLI path
-      let cliCmd = "opengame"
-      let cliArgs = args
-
-      // Check if opengame is available
-      const { execSync } = require("child_process")
-      try {
-        execSync("which opengame", { stdio: "ignore" })
-      } catch {
-        // Try npx
-        try {
-          const opengameDir = process.env.OPENGAME_DIR || "../"
-          const distPath = `${opengameDir}dist/cli.js`
-          cliCmd = "node"
-          cliArgs = [distPath, ...args]
-        } catch {
-          send("error", "OpenGame CLI not found. Install it or set OPENGAME_DIR.")
-          controller.close()
-          return
-        }
       }
 
       send("info", `Launching: ${cliCmd} ${cliArgs.join(" ")}`)
@@ -124,7 +157,6 @@ export async function POST(request: NextRequest) {
         for (const line of lines) {
           if (!line.trim()) continue
           try {
-            // Try to parse as JSON (stream-json format)
             const data = JSON.parse(line)
             if (data.type === "tool_use" || data.type === "tool_call") {
               send("tool", `[${data.name || "tool"}] ${JSON.stringify(data.input || data.args || {}, null, 2)}`)
@@ -136,7 +168,6 @@ export async function POST(request: NextRequest) {
               send("output", line)
             }
           } catch {
-            // Plain text output
             send("output", line)
           }
         }
@@ -160,7 +191,6 @@ export async function POST(request: NextRequest) {
         controller.close()
       })
 
-      // Handle abort
       request.signal.addEventListener("abort", () => {
         child.kill("SIGTERM")
         controller.close()
